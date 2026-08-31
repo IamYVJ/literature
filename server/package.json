@@ -1,0 +1,18 @@
+{
+  "name": "literature-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Optional authoritative server for Literature. The static P2P client works without it.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "ws": "8.18.0"
+  },
+  "license": "MIT"
+}

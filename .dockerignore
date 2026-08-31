@@ -1,0 +1,51 @@
+# Build context for server/Dockerfile. The context is the repo ROOT (the server
+# imports the same engine the browser runs, so js/ has to be in scope) — which
+# means everything that makes this a *static site* is in scope too and has no
+# business in a server image.
+#
+# Two of these entries are about safety rather than size: node_modules would
+# overwrite the arm64 modules installed inside the image with whatever a Windows or
+# x86 machine had lying around, and the .env rules keep a local secrets file from
+# being baked into a layer where `docker history` would show it.
+
+# --- never, under any circumstances ---
+.env
+.env.*
+*.pem
+*.key
+
+# --- host build artefacts that must not shadow the image's own ---
+node_modules
+server/node_modules
+npm-debug.log*
+
+# --- the static client: served by GitHub Pages, not by this container ---
+index.html
+manifest.webmanifest
+sw.js
+css/
+icons/
+scripts/
+*.jpg
+*.png
+*.md
+
+# The three browser-only modules. `COPY js/ ./js/` takes the directory whole, so
+# this is the only place the line can be drawn — and it is worth drawing: main.js
+# reaches for `document`, net.js for `window.Peer`, ui.js for both. None of them
+# is reachable from server/ (the layering forbids it, and `grep -r 'ui.js' server/`
+# finds nothing but a comment), so leaving them out costs nothing and makes the
+# rule structural: if a server module ever did import one, the container would
+# fail on the first line of the first boot instead of the first time a player
+# reached whatever it was needed for.
+js/main.js
+js/net.js
+js/ui.js
+
+# --- repo furniture ---
+.git
+.gitignore
+.gitattributes
+.github
+.claude
+LICENSE

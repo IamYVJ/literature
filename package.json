@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Static peer-to-peer web implementation of the card game Literature (Fish).",
   "scripts": {
-    "test": "node scripts/test-engine.mjs && node scripts/test-bots.mjs",
+    "test": "node scripts/test-engine.mjs && node scripts/test-bots.mjs && node scripts/test-server.mjs",
     "icons": "node scripts/gen-icons.js",
     "serve": "python -m http.server 8000"
   },

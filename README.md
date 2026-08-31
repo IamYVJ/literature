@@ -8,6 +8,13 @@ game logic and authoritative state live in the host's tab — **no game server, 
 accounts** — and every player plays on their own device, so **your hand stays
 yours**. Installable as a PWA that works offline (app shell).
 
+Point it at a self-hosted server and the same game runs over the internet
+instead, with nobody's tab holding it up. That is **additive**: the server is one
+URL in [`js/config.js`](js/config.js), the app probes it before offering
+anything, and with no server configured — or with the server switched off — this
+is exactly the peer-to-peer game described above. See
+[**Playing over the internet**](#playing-over-the-internet-optional-server).
+
 Short of a table? **Bots** fill the empty seats and play a real game: they track
 the public record of asks, deduce what they can prove, and gamble when proof runs
 out. A solo game against five bots needs nobody else at all.
@@ -139,13 +146,72 @@ is still being exercised, precisely so that deadlock can't come back unnoticed.
 > Everyone must be reaching the same URL — share the link, not a screenshot of
 > the code.
 
+## Playing over the internet (optional server)
+
+Hosting from a tab has two limits no amount of client code can fix: a direct
+connection between two devices sometimes cannot be made at all, and the game
+lives in the host's browser, so closing it stops everything. The optional server
+removes both. It is a small Node process — four files, one dependency (`ws`) —
+that keeps rooms in memory and **imports the browser's own engine, guards and
+bots**, so it is the same rules, the same house-rule switches and the same bot
+brain, just applied on a machine nobody has to keep awake.
+
+### How the app decides which one to use
+
+1. At boot the app probes the server once, with a 4-second timeout. Nothing
+   server-shaped is drawn until that answers.
+2. If it answers, the home screen grows a **Host online** button, and any open
+   lobbies appear under **Games online**.
+3. If it doesn't — no server configured, server switched off, no internet — the
+   app says so in one line and behaves exactly as it always did.
+4. **Join** is one button for both kinds of game. A typed code is tried on the
+   server first when the server is up, and a code the server has never heard of
+   falls through to a peer-to-peer join on the same code. Players never have to
+   know which sort of game they were invited to.
+
+### What changes when the server is running the game
+
+- **Nobody is the host.** The player who opened the table still gets the lobby
+  controls and **Play again** — they are the one the engine calls `hostId` — but
+  no browser holds the engine, so their closing the tab ends nothing. They rejoin
+  and their hand is still there.
+- **Identity is the device, not the name.** Each browser mints a random
+  `clientId` on first run and keeps it in `localStorage`, and that is what
+  reclaims a seat mid-game. It never appears in the URL or on screen. The server
+  enforces it in its own seat map, outside the shared engine.
+- **Bots and empty chairs keep playing with the tab shut.** This is the one place
+  the transport changes the *game* rather than just who is holding it. A bot moves
+  when the machine running the game ticks, and hosting from a tab that machine is
+  somebody's phone — lock it and the table stops. It matters more in Literature
+  than in most games, because **a hit keeps the turn**: a player who walks away
+  mid-run doesn't cost the table one beat, they stop it dead. So an unattended
+  seat is played for after a while, by the same bot code — after 8 seconds when a
+  browser is hosting, after 30 on the server (`AWAY_MS`), because a phone in the
+  same room gets the benefit of "hang on, my screen locked" and a stranger three
+  cities away does not. **If you are seating bots, host online if you can.**
+- **The turn clock keeps running too**, for the same reason, if the host has
+  switched it on.
+- **Rooms expire.** Six hours idle, or 15 minutes with nobody in them. Nothing is
+  ever written to disk — a restart is a clean slate.
+- **A drop looks like a reconnect.** Losing the socket keeps the table on screen
+  behind a *Lost the server — getting back in* banner and retries for ~30s, just
+  like losing a peer host. A redeploy therefore looks like a blip, not an ending.
+
+### Turning it off
+
+Blank `HOST` in [`js/config.js`](js/config.js). Every server control is gated on
+that file naming an endpoint *and* on the live health probe, so the app goes back
+to being a static peer-to-peer site with no backend — which is also what it does
+on a plane.
+
 ## Project layout
 
 ```
 index.html              app shell (loads PeerJS + fonts, registers the SW)
 manifest.webmanifest    PWA manifest (relative paths, for /repo/ subpaths)
 sw.js                   service worker — precaches the shell, then stale-while-
-                          revalidate (bump CACHE when imports change)
+                          revalidate (bump CACHE when imports change; never
+                          caches /health, so a dead server can't look alive)
 css/styles.css          dark reading-room theme (brass on ink, card-stock cards)
 js/
   cards.js              ← the deck: half-suit sets, card codes, labels, grouping.
@@ -161,11 +227,26 @@ js/
                           Imports nothing, so plain `node` can test it.
   bots.js               ← bot inference and move choice. Imports ONLY cards.js,
                           so a bot cannot reach the engine
+  botdriver.js          the paced driver around bots.js — whose turn, how long to
+                          pause, and the away-seat rule. Shared by the browser
+                          host and the server, so a bot plays identically on both
   net.js                PeerJS transport (BROKER_CONFIG at the top), broker
-                          recovery, per-connection rate limiting
+                          recovery, per-connection rate limiting — and the
+                          WebSocket transport + the liveness and room probes
+  config.js             ← the server-mode switch: blank the host and server mode
+                          does not exist
   ui.js                 rendering (pure view layer — never mutates app state)
   util.js               helpers (room code, clipboard, persistence, clientId, DOM)
   main.js               controller wiring net + engine + bots + UI together
+server/                 the OPTIONAL authoritative server (nothing else needs it)
+  index.js              HTTP endpoints + WebSocket bootstrap — the only file that
+                          imports `ws`, which is what keeps npm test install-free
+  guards.js             thin re-export of js/guards.js, plus the origin allowlist
+  rooms.js              room registry, codes, ceilings, expiry, the operator log
+  session.js            seats, clientId identity and mid-game reclaim
+  Dockerfile            arm64 image — build from the REPO ROOT, it needs js/
+  compose.yaml          deployment stack for the Pi (no ports: on purpose)
+  package.json          the server's one dependency
 icons/                  app icons (svg source + generated png)
 scripts/
   gen-icons.js          regenerates the PNG icons (node, no deps)
@@ -174,15 +255,19 @@ scripts/
                           and that hands stay hidden
   test-bots.mjs         headless tests — bot inference and 30 seeded full games,
                           plus the intent dispatcher and the frame guards
+  test-server.mjs       headless tests — the wire protocol, the security guards,
+                          reclaim, the away-seat rule, and whole games played
+                          through Session.handleFrame() over a stub socket
 .github/workflows/
   ci.yml                runs npm test on every push
+  server.yml            tests, then builds and pushes the arm64 server image
 package.json            npm test / npm run icons (no dependencies)
 ```
 
 ## Tests
 
 ```
-npm test            # scripts/test-engine.mjs && scripts/test-bots.mjs
+npm test            # test-engine.mjs && test-bots.mjs && test-server.mjs
 ```
 
 No framework and no install: a couple of assertion helpers and a seeded LCG
@@ -190,7 +275,11 @@ standing in for `crypto.getRandomValues`, so a deal is reproducible and a failur
 is a fixed sequence of moves rather than a story about one. `test-bots.mjs` plays
 30 complete games and checks that no *provable* claim was ever wrong, that no
 deduction ever contradicted a real hand, that no game deadlocked, and that
-`js/bots.js` still imports nothing but `js/cards.js`.
+`js/bots.js` still imports nothing but `js/cards.js`. `test-server.mjs` drives the
+server through a stub WebSocket — no listening port, no `ws` — and asserts the
+things a public endpoint has to get right: the origin allowlist, the rate limit,
+that a seat is reclaimed by `clientId` and never by name, and that no frame
+addressed to one player ever contains another player's cards.
 
 ---
 

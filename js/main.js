@@ -16,18 +16,32 @@
 //   and it sends the private slice per connection — never through broadcast().
 //   If that loop is ever rewritten to broadcast one payload, every player sees
 //   every hand and the game is over. It is a five-line function for that reason.
+//
+// A THIRD MODE THAT IS NOT A THIRD PATH
+//   mode 'server' is the client role again, pointed at a WebSocket instead of at
+//   a peer. No browser holds the engine there, so even the player who opened the
+//   table sends every lobby control over the wire — which is why "am I the host"
+//   became a question about pub.hostId (asked in ui.js) rather than about which
+//   button was tapped. Everything server-shaped is gated on js/config.js naming a
+//   server AND a live health probe, so with the host blanked this file behaves
+//   exactly as it did before server mode existed.
 // ============================================================================
 
 import { PHASES, GameEngine } from './state.js';
 import { applyGameIntent } from './intents.js';
-import { AskMemory, AWAY_PLAY_MS, BOT_THINK_MS, chooseBotMove } from './bots.js';
+import { createBotDriver } from './botdriver.js';
 import { validClientId } from './guards.js';
 import {
-  describePeerError, isFatalPeerError, createHost, joinHost,
+  describePeerError, describeServerRejection, fetchServerRooms, isFatalPeerError,
+  createHost, joinHost, probeServer, serverTransport,
 } from './net.js';
 import {
-  clearSession, clientId, copyText, generateRoomCode, loadCode, loadEngineSnapshot,
-  loadName, loadSession, saveCode, saveEngineSnapshot, saveName, saveSession,
+  SERVER_HEALTH, SERVER_ROOMS, SERVER_URL, serverConfigured,
+} from './config.js';
+import {
+  CODE_LENGTH, clearSession, clientId, copyText, generateRoomCode, loadCode,
+  loadEngineSnapshot, loadName, loadSession, normalizeCode, saveCode,
+  saveEngineSnapshot, saveName, saveSession,
 } from './util.js';
 import { announce, render } from './ui.js';
 
@@ -39,7 +53,7 @@ const root = document.getElementById('app');
 
 const app = {
   screen: 'home',
-  mode: null,        // 'host' | 'client'
+  mode: null,        // 'host' | 'client' | 'server'
   code: '',
   name: loadName(),
   myId: null,
@@ -47,9 +61,21 @@ const app = {
   priv: null,
   error: '',
   status: '',
-  busy: null,        // 'host' | 'join' — disables the buttons that started it
+  busy: null,        // 'host' | 'hostOnline' | 'join' — disables the button
   connected: false,
   clock: null,
+
+  // Is there an authoritative server, and is it awake? 'off' means js/config.js
+  // names none, and then no server control is ever drawn and none of the code
+  // below runs. The other states are the health probe's: 'unknown' before it has
+  // been asked, 'checking' while it is in flight, then 'up' or 'down'.
+  server: { state: serverConfigured() ? 'unknown' : 'off', version: '' },
+
+  // Open lobbies on the server, or null for "no list" — which covers a server
+  // that is down and one with ROOMS_LIST=0 alike, because the UI treats them the
+  // same: it shows nothing, and typing a code still works.
+  serverRooms: null,
+
   ui: {
     joinCode: loadCode(),
     setId: null,
@@ -66,11 +92,9 @@ let engine = null;   // host only
 let net = null;
 let hostReady = false;
 
-// Shared by every bot at the table: it holds only what was said out loud.
-let botMemory = new AskMemory();
-let botTimer = null;
-let seenAsks = 0;
-let seenClaims = 0;
+// Bot pacing and the shared table memory. The same module the server runs, so a
+// bot plays identically whichever machine is holding the engine.
+const bots = createBotDriver();
 
 // ---------------------------------------------------------------------------
 // Render
@@ -195,29 +219,11 @@ function hostSync() {
     });
   }
 
-  syncBotMemory();
+  // Keep the table's memory level with the move that just happened rather than
+  // waiting for the next tick to catch up. The driver would do it anyway; doing
+  // it here means a bot always decides on the very latest question.
+  bots.observe(engine);
   draw();
-  scheduleBot();
-}
-
-/**
- * Tell the bots what the table just heard.
- *
- * Read off the ENGINE rather than publicState(), because config.showHistory can
- * blank the record and that setting is about what a person is shown, not about
- * what anyone remembers. A player at a real table still heard the question.
- */
-function syncBotMemory() {
-  for (const c of engine.claims.slice(seenClaims)) botMemory.observeClaim(c);
-  seenClaims = engine.claims.length;
-  for (const h of engine.history) if (h.n > seenAsks) botMemory.observeAsk(h);
-  seenAsks = engine.askCount;
-}
-
-function resetBotMemory() {
-  botMemory.reset();
-  seenAsks = 0;
-  seenClaims = 0;
 }
 
 /** Deliver a refusal to one player. The host has no connection to itself, so its
@@ -268,44 +274,11 @@ function dispatchIntent(playerId, msg) {
 
   // A fresh deal makes every remembered fact worthless, and keeping them would
   // be worse than forgetting: they would be certainties about the last hand.
-  if (before !== PHASES.PLAY && engine.phase === PHASES.PLAY) resetBotMemory();
+  // The driver detects this for itself; saying so explicitly also throws away a
+  // pause left over from the game that just ended.
+  if (before !== PHASES.PLAY && engine.phase === PHASES.PLAY) bots.reset();
 
   hostSync();
-}
-
-// ---- Bots -----------------------------------------------------------------
-//
-// One bot moves per timer, then hostSync() schedules the next. A loop would be
-// instant and unreadable; this way a table of bots plays at a watchable pace and
-// a human's turn interrupts it naturally, because the timer only ever fires for
-// whoever is actually on turn.
-// A seat nobody is sitting in counts as a bot seat for this purpose. Otherwise
-// one closed tab stops the game for everybody: the engine only ever advances the
-// turn on a move or on the clock, and the clock is off unless the table turned it
-// on. The host holds every hand, so it can play the empty chair itself.
-const unattended = (p) => !!p && (p.isBot || !p.online);
-
-function scheduleBot() {
-  if (botTimer) { clearTimeout(botTimer); botTimer = null; }
-  if (!engine || engine.phase !== PHASES.PLAY) return;
-
-  const turn = engine.turnPlayer;
-  if (!unattended(turn)) return;
-
-  botTimer = setTimeout(() => {
-    botTimer = null;
-    if (!engine || engine.phase !== PHASES.PLAY) return;
-    const me = engine.turnPlayer;
-    if (!unattended(me)) return;
-
-    const move = chooseBotMove(botMemory, engine.publicState(), engine.privateStateFor(me.id));
-    // Only happens with no set left to claim, which is already game over and is
-    // caught above. Bailing here would stop the chain for good — nothing else
-    // reschedules it, and the turn clock is off unless the table turned it on.
-    if (!move) return;
-    applyGameIntent(engine, me.id, move);
-    hostSync();
-  }, turn.isBot ? BOT_THINK_MS : AWAY_PLAY_MS);
 }
 
 function hostHandlers() {
@@ -347,6 +320,9 @@ function hostHandlers() {
 }
 
 function startHosting(code, resumed = false) {
+  // Nobody is looking at the home screen any more, and a poll that outlived it
+  // would keep asking the Pi for lobbies all through the game.
+  stopRoomsPoll();
   app.mode = 'host';
   app.code = code;
   app.myId = HOST_ID;
@@ -361,7 +337,7 @@ function startHosting(code, resumed = false) {
   if (!resumed) {
     engine = new GameEngine({ hostId: HOST_ID });
     engine.addPlayer(HOST_ID, app.name, { isHost: true, clientId: clientId() });
-    resetBotMemory();
+    bots.reset();
   }
 
   hostSync();
@@ -377,12 +353,17 @@ function host() {
 }
 
 // ---------------------------------------------------------------------------
-// CLIENT
+// CLIENT (peer-to-peer)
+//
+// Named joinPeer rather than join because there are two joins now and only one of
+// them dials a browser. actions.join below is the one a button calls: it decides
+// which of the two this code is for.
 // ---------------------------------------------------------------------------
-function join(rawCode) {
+function joinPeer(rawCode) {
   const name = (app.name || '').trim();
   if (!name) { app.error = 'Enter a name first.'; draw(); return; }
 
+  stopRoomsPoll();
   const code = (rawCode || '').toUpperCase();
   app.mode = 'client';
   app.code = code;
@@ -515,6 +496,318 @@ function fromHost(msg, timeout, code, name) {
 }
 
 // ---------------------------------------------------------------------------
+// SERVER MODE — the same game, carried by a WebSocket to an authoritative server.
+//
+// Structurally this is the JOINING path for everybody, the table's owner included:
+// no browser holds a GameEngine here, so `engine` stays null and every tap — the
+// owner's lobby controls as much as anyone's ask — travels over the wire through
+// the untouched actions.send(). The owner is not a special client; they are just
+// the player whose id the server put in pub.hostId.
+//
+// Identity is this device's clientId, never the name typed on the home screen.
+// That is what stops a seat being taken on a public endpoint by anyone who can
+// read a name off the lobby, and it is why a reconnect can reclaim a HAND
+// mid-game without the server trusting a word the returning socket says about who
+// it is. See server/session.js.
+// ---------------------------------------------------------------------------
+
+// What this attempt was trying to do, kept so a retry can repeat it and so a
+// refusal knows which code the player actually typed.
+let serverIntent = null;
+
+// The server transport does no reconnecting of its own — unlike joinHost(), which
+// redials the broker — because only this file knows whether a closed socket
+// interrupted a game or a doomed join. So the retry loop lives here.
+let serverRetry = null;
+let serverTries = 0;
+const SERVER_RETRIES = 6;      // 1+2+4+8+8+8s ≈ 31s before we call it a night
+
+function startServerGame({ create = false, code = '', name = '', reconnect = false } = {}) {
+  const clean = (name || '').trim();
+  if (!clean) { app.error = 'Enter a name first.'; draw(); return; }
+
+  // A create has no code yet: the server mints one and sends it back in `welcome`.
+  const roomCode = create ? '' : normalizeCode(code);
+  if (!create && roomCode.length !== CODE_LENGTH) {
+    app.error = 'That room code is not valid.';
+    draw();
+    return;
+  }
+
+  stopRoomsPoll();
+  if (!reconnect) clearServerRetry();
+
+  app.mode = 'server';
+  app.name = clean;
+  saveName(clean);
+  // Nothing in this tab for an intent to be applied to, and it matters more than
+  // it looks: the tick below calls hostSync() whenever `engine` is set, and
+  // hostSync() reaches for net.connections — which a WebSocket does not have.
+  engine = null;
+  bots.reset();
+
+  if (roomCode) { app.code = roomCode; saveCode(roomCode); }
+  else if (!reconnect) app.code = '';
+  app.error = '';
+  app.connected = false;
+  if (!reconnect) {
+    app.busy = create ? 'hostOnline' : 'join';
+    app.status = 'Connecting…';
+  }
+  serverIntent = { code: roomCode, name: clean, create: !!create };
+  draw();
+
+  // The same deadline the peer join uses, for the same reason: a socket that hangs
+  // instead of failing leaves the player watching 'Connecting…' forever. A
+  // reconnect needs none — it has the retry loop, and the board stays up.
+  let timeout = null;
+  if (!reconnect) {
+    timeout = setTimeout(() => {
+      timeout = null;
+      if (app.pub) return;
+      app.server.state = 'down';
+      giveUpOnServer("The game server didn't answer. It may be switched off — you can still host a game over Wi-Fi.");
+    }, 15000);
+  }
+
+  net = serverTransport(SERVER_URL, {
+    onOpen: () => {
+      app.server.state = 'up';
+      app.connected = true;
+      app.status = create ? 'Opening a table…' : 'Joining…';
+      // createRoom happens once, ever. Every attempt after that is a join, or a
+      // blip on the owner's phone would open a second empty room and orphan the
+      // game everyone else is sitting in — see the welcome handler.
+      if (create) net.send({ type: 'createRoom', name: clean, clientId: clientId() });
+      else net.send({ type: 'join', code: app.code, name: clean, clientId: clientId() });
+      draw();
+    },
+
+    // Everything here came off a public endpoint and is rendered more or less
+    // directly. Same guard, and same reason, as the peer client's onData.
+    onData: (msg) => {
+      try {
+        fromServer(msg, () => { if (timeout) { clearTimeout(timeout); timeout = null; } });
+      } catch (err) {
+        console.warn('Dropped an unusable message from the server', err);
+      }
+    },
+
+    // app.pub marks "we were in a real game" — the case worth retrying rather than
+    // abandoning. everOpened separates a server that refused us (an origin check,
+    // a full server) from one that is not there at all.
+    onClose: ({ everOpened }) => {
+      app.connected = false;
+      if (app.pub) { scheduleServerRetry(); return; }
+      if (timeout) { clearTimeout(timeout); timeout = null; }
+      if (!everOpened) app.server.state = 'down';
+      giveUpOnServer(everOpened
+        ? 'The server closed the connection before the game started.'
+        : "Couldn't reach the game server. It may be switched off — you can still host a game over Wi-Fi.");
+    },
+
+    onError: () => { /* a close always follows, and that is where we decide */ },
+  });
+}
+
+/** Abandon a server attempt and say why. Kills the retry loop too, so a failure
+ *  the player is reading about is not being quietly retried underneath it. */
+function giveUpOnServer(message) {
+  clearServerRetry();
+  teardownNet();
+  serverIntent = null;
+  app.mode = null;
+  app.busy = null;
+  app.status = '';
+  app.screen = 'home';
+  app.error = message;
+  draw();
+}
+
+function fromServer(msg, clearJoinTimer) {
+  if (!msg || typeof msg.type !== 'string') return;
+
+  switch (msg.type) {
+    case 'welcome':
+      clearJoinTimer();
+      app.myId = msg.playerId;
+      if (msg.code) { app.code = msg.code; saveCode(app.code); }
+      // The room exists from here on, so a retry must join it rather than create
+      // another. This is the line that makes the owner's reconnect safe.
+      if (serverIntent) serverIntent = { ...serverIntent, code: app.code, create: false };
+      saveSession({ mode: 'server', code: app.code, name: app.name });
+      app.busy = null;
+      app.status = '';
+      draw();
+      break;
+
+    case 'state': {
+      // Same shape check as the peer path: pub is rendered straight away and
+      // ui.js reads pub.players, so a truthy-but-wrong object is the difference
+      // between a dropped frame and a dead tab.
+      if (!msg.pub || !Array.isArray(msg.pub.players)) return;
+
+      if (!msg.priv) {
+        // priv: null after a welcome means the seat is gone — the same removal
+        // signal the peer host sends, deliberately, so this branch reads the same
+        // on both transports. Before the welcome it only means somebody else's
+        // move triggered a broadcast while our join was still in flight.
+        if (!app.myId) return;
+        leave();
+        app.error = 'The host removed you from the table.';
+        draw();
+        return;
+      }
+
+      clearJoinTimer();
+      clearServerRetry();
+      app.busy = null;
+      app.status = '';
+      app.connected = true;
+      applyView(msg.pub, msg.priv);
+      draw();
+      break;
+    }
+
+    case 'rejected':
+      clearJoinTimer();
+      serverRejected(msg);
+      break;
+
+    case 'error':
+      app.error = typeof msg.message === 'string' ? msg.message : '';
+      draw();
+      break;
+
+    default:
+      break;
+  }
+}
+
+/** A refusal is fatal to THIS attempt — the server closes the socket behind it. */
+function serverRejected(msg) {
+  const reason = msg && msg.reason;
+  const wanted = serverIntent;
+  clearServerRetry();
+  teardownNet();
+  serverIntent = null;
+  app.mode = null;
+
+  // The server has never heard of this code — but a phone on this Wi-Fi might be
+  // hosting it. Falling through to the peer join is what lets ONE Join button
+  // cover both kinds of game, so a player never has to know which one they were
+  // invited to. Only for a code the player typed, and only before we had a game:
+  // a mid-game 'no-room' means the room was swept, not misaddressed.
+  if (reason === 'no-room' && wanted && wanted.code && !app.pub) {
+    joinPeer(wanted.code);
+    return;
+  }
+
+  clearSession();
+  app.pub = null;
+  app.priv = null;
+  app.myId = null;
+  app.busy = null;
+  app.status = '';
+  app.screen = 'home';
+  app.error = describeServerRejection(reason, msg && msg.message);
+  refreshServerRooms();
+  draw();
+}
+
+/**
+ * A dropped socket mid-game is worth retrying before telling anyone their game is
+ * over: the address never moves, the seat is still theirs, and the server hands it
+ * back on the strength of this device's clientId rather than its name.
+ */
+function scheduleServerRetry() {
+  if (serverRetry) return;
+  if (serverTries >= SERVER_RETRIES) {
+    clearServerRetry();
+    app.status = '';
+    app.error = 'Lost the server and could not get back. Reload to try again — your seat is still yours.';
+    draw();
+    return;
+  }
+  const delay = Math.min(1000 * 2 ** serverTries, 8000);
+  serverTries += 1;
+  app.connected = false;
+  app.status = 'Lost the server — getting back in.';
+  draw();
+
+  serverRetry = setTimeout(() => {
+    serverRetry = null;
+    teardownNet();
+    // Note the absent `create`: a returning owner rejoins the room they already
+    // made. serverIntent was rewritten at the welcome for exactly this.
+    startServerGame({ code: app.code, name: app.name, reconnect: true });
+  }, delay);
+}
+
+function clearServerRetry() {
+  if (serverRetry) { clearTimeout(serverRetry); serverRetry = null; }
+  serverTries = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Is the server there? Asked once at boot and again whenever the answer could
+// have changed. Every server-shaped control in the UI is gated on the result, so a
+// Pi that is off, missing or unreachable is simply never offered — which is what
+// keeps this an honest peer-to-peer game by default.
+// ---------------------------------------------------------------------------
+
+// The in-flight probe, so two callers await one request rather than racing two.
+let serverProbe = null;
+
+function checkServer() {
+  if (!serverConfigured()) { app.server.state = 'off'; return Promise.resolve(); }
+  if (serverProbe) return serverProbe;
+
+  app.server.state = 'checking';
+  draw();
+  serverProbe = (async () => {
+    const info = await probeServer(SERVER_HEALTH);
+    app.server.state = info ? 'up' : 'down';
+    app.server.version = (info && info.version) || '';
+    serverProbe = null;
+    draw();
+  })();
+  return serverProbe;
+}
+
+// Open lobbies on the server, polled while the home screen is up.
+//
+// Codes were never secrets, but this list hands them out — see ROOMS_LIST in
+// server/compose.yaml, which can switch it off. It is offered because the public
+// PeerJS broker has enumeration disabled, so on the server this is the only way to
+// find a game without being told the code.
+const ROOMS_POLL_MS = 6000;
+let roomsTimer = null;
+
+function refreshServerRooms() {
+  stopRoomsPoll();
+  if (!serverConfigured()) return;
+
+  const tick = async () => {
+    roomsTimer = null;
+    const rooms = await fetchServerRooms(SERVER_ROOMS);
+    if (app.screen !== 'home') return;      // they left while it was in flight
+    app.serverRooms = rooms;
+    if (rooms) app.server.state = 'up';
+    draw();
+    // Stop on null rather than retrying: that is a server which is down or has
+    // the list switched off, and neither is worth a request every few seconds.
+    // The health probe already tells the player which of the two it is.
+    if (rooms) roomsTimer = setTimeout(tick, ROOMS_POLL_MS);
+  };
+  tick();
+}
+
+function stopRoomsPoll() {
+  if (roomsTimer) { clearTimeout(roomsTimer); roomsTimer = null; }
+}
+
+// ---------------------------------------------------------------------------
 // Leaving and resuming
 // ---------------------------------------------------------------------------
 function teardownNet() {
@@ -523,11 +816,12 @@ function teardownNet() {
 }
 
 function leave() {
-  if (botTimer) { clearTimeout(botTimer); botTimer = null; }
   teardownNet();
   clearSession();
+  clearServerRetry();
+  serverIntent = null;
   engine = null;
-  resetBotMemory();
+  bots.reset();
 
   app.mode = null;
   app.screen = 'home';
@@ -545,6 +839,11 @@ function leave() {
   app.ui.code = null;
   app.ui.targetId = null;
   draw();
+
+  // Back on the home screen, where both of these are worth knowing again and both
+  // may have changed while the game was on. Cheap, and neither can fail loudly.
+  checkServer();
+  refreshServerRooms();
 }
 
 /** A reload should not lose the game. A host rehydrates its engine from the
@@ -563,8 +862,11 @@ function resumeIfPossible() {
     if (!restored) return false;
     engine = restored;
     engine.resumeAsHost(HOST_ID);
-    resetBotMemory();
-    syncBotMemory();
+    // Rebuild the table's memory from the record the snapshot carried, so the
+    // bots come back knowing what they knew rather than starting the second half
+    // of a game with amnesia.
+    bots.reset();
+    bots.observe(engine);
     app.status = 'Picking up where you left off.';
     startHosting(session.code, true);
     return true;
@@ -572,7 +874,17 @@ function resumeIfPossible() {
 
   if (session.mode === 'client') {
     app.status = 'Rejoining…';
-    join(session.code);
+    joinPeer(session.code);
+    return true;
+  }
+
+  // A server game needs nothing rehydrated here — the engine never left the Pi.
+  // Rejoining is the whole of it, and this device's clientId is what gets the seat
+  // and the hand back. No fall-through to the peer path: the session records which
+  // transport the game was on, and a server code means nothing to a phone on this
+  // Wi-Fi.
+  if (session.mode === 'server' && session.name && serverConfigured()) {
+    startServerGame({ code: session.code, name: session.name });
     return true;
   }
 
@@ -580,15 +892,24 @@ function resumeIfPossible() {
 }
 
 // ---------------------------------------------------------------------------
-// The tick. One interval drives the turn clock display for everyone and the
-// timeout itself for the host, because the engine deliberately owns no timers.
+// The tick. One interval drives the turn clock display for everyone, and for a
+// host it also drives the timeout itself and the bots — because the engine
+// deliberately owns no timers and the driver deliberately owns none either.
+//
+// A heartbeat rather than a chain of one-shot timers: a bot's move used to
+// schedule the next one, so a single missed link stopped the table for good. A
+// tick that re-reads the engine every half second cannot lose its place.
 // ---------------------------------------------------------------------------
 setInterval(() => {
   if (!app.pub || app.pub.phase !== PHASES.PLAY) return;
 
   if (engine) {
-    const fired = engine.checkTurnTimeout(Date.now());
-    if (fired.fired) { hostSync(); return; }
+    const now = Date.now();
+    // Clock first: a player who has just run out of time has to lose the turn
+    // before a bot is offered it, or a bot would move on a turn that was already
+    // over — on the very tick that was about to end it.
+    if (engine.checkTurnTimeout(now).fired) { hostSync(); return; }
+    if (bots.tick(engine, now)) { hostSync(); return; }
   }
 
   const before = app.clock;
@@ -600,7 +921,15 @@ setInterval(() => {
 // Actions — the whole surface ui.js is given.
 // ---------------------------------------------------------------------------
 const actions = {
-  /** One intent, one path: the host runs it, a client posts it to the host. */
+  /**
+   * One intent, one path: the host runs it, everyone else posts it.
+   *
+   * "Everyone else" is both other modes, and that is the point — a peer client
+   * writes to a DataConnection and a server client writes to a WebSocket, but
+   * net.send is the same call and neither one knows the difference. On the server
+   * transport this branch carries the OWNER's lobby controls too, because their
+   * browser is holding no engine to apply them to.
+   */
   send(msg) {
     app.error = '';
     if (app.mode === 'host') handleIntent(HOST_ID, msg);
@@ -622,8 +951,61 @@ const actions = {
   },
 
   host,
-  join,
   leave,
+
+  /** Host on the server instead of in this tab. Only ever offered once the health
+   *  probe has come back — see app.server here and the gating in ui.js. */
+  hostOnline() {
+    const name = (app.name || '').trim();
+    if (!name) { app.error = 'Enter a name first.'; draw(); return; }
+    app.busy = 'hostOnline';
+    app.error = '';
+    draw();
+    startServerGame({ create: true, name });
+  },
+
+  /**
+   * ONE Join button for both kinds of game.
+   *
+   * A player is told a four-character code, not a transport. So when there is a
+   * server and it is answering, ask it first; a code it has never heard of falls
+   * through to the peer join (see serverRejected). With no server configured, or
+   * one that is switched off, this is the peer join it has always been.
+   */
+  async join(code) {
+    const name = (app.name || '').trim();
+    if (!name) { app.error = 'Enter a name first.'; draw(); return; }
+
+    // The boot probe may still be in flight. Waiting for it beats guessing: a peer
+    // attempt at a server-side code costs the player the whole 15-second join
+    // timeout before it admits defeat, and a server that is up answers in ms.
+    if (serverConfigured()
+        && (app.server.state === 'unknown' || app.server.state === 'checking')) {
+      app.busy = 'join';
+      app.error = '';
+      app.status = 'Looking for that game…';
+      draw();
+      await checkServer();
+      // They started something else while we were asking.
+      if (app.busy !== 'join' || app.screen !== 'home') return;
+      app.busy = null;
+      app.status = '';
+    }
+
+    if (app.server.state === 'up') { startServerGame({ code, name }); return; }
+    joinPeer(code);
+  },
+
+  /** Join a specific open lobby from the server's list. No peer fallback here:
+   *  this code came from the server itself, so a refusal is about the room rather
+   *  than about which transport the game is on. */
+  joinServerRoom(code) {
+    const name = (app.name || '').trim();
+    if (!name) { app.error = 'Enter a name first.'; draw(); return; }
+    app.error = '';
+    app.ui.joinCode = code;
+    startServerGame({ code, name });
+  },
 
   clearError() { app.error = ''; draw(); },
 
@@ -661,11 +1043,30 @@ const actions = {
 // ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
-if (!window.Peer) {
+/**
+ * PeerJS is what the peer-to-peer path needs, and what the server path does not.
+ *
+ * So the complaint waits until we know whether there is a server: telling a player
+ * the app is broken while "Host online" would have worked perfectly is worse than
+ * saying nothing for the second or two the probe takes. With no server configured
+ * there is nothing to wait for and this fires immediately, exactly as before.
+ */
+function reportMissingPeer() {
+  if (window.Peer || app.error || app.server.state === 'up') return;
   app.error = 'Could not load the networking library. Check your connection and reload.';
+  draw();
 }
 
 if (!resumeIfPossible()) draw();
+
+if (serverConfigured()) {
+  checkServer().then(() => {
+    reportMissingPeer();
+    if (app.screen === 'home') refreshServerRooms();
+  });
+} else {
+  reportMissingPeer();
+}
 
 // The service worker is a progressive enhancement: a failure to register means
 // no offline shell, which is not a reason to refuse to play.

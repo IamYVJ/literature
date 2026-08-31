@@ -48,8 +48,29 @@ const BOT_NAMES = Object.freeze([
   'Ferrante', 'Gogol', 'Hurston', 'Ishiguro', 'Joyce',
 ]);
 
-function cleanName(name) {
-  return String(name ?? '').replace(/\s+/g, ' ').trim().slice(0, MAX_NAME);
+/**
+ * A display name, bounded.
+ *
+ * Exported because the WebSocket server has to clean a name BEFORE it reaches
+ * addPlayer() — it refuses a duplicate itself rather than letting the engine's
+ * reclaim-by-name branch be reachable from a public endpoint (see
+ * server/session.js). Two callers, one definition, so the two transports cannot
+ * disagree about what a name is.
+ *
+ * Control characters go first and separately from the whitespace collapse.
+ * \p{Cc} covers tab, newline and carriage return as well as the invisible C0/C1
+ * range, so they are turned into a space rather than deleted — otherwise
+ * "Anna\tKarenina" would clean to "AnnaKarenina". What this buys is that a name
+ * cannot carry a newline: names are printed into the server's operator log, and
+ * a player calling themselves "[game] ABCD END" would otherwise be able to forge
+ * a log line.
+ */
+export function cleanName(name) {
+  return String(name ?? '')
+    .replace(/\p{Cc}/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, MAX_NAME);
 }
 
 /**

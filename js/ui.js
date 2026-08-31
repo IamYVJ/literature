@@ -124,6 +124,7 @@ function homeScreen(app, actions) {
           onclick: () => actions.host(),
         }, app.busy === 'host' ? 'Starting…' : 'Host a game'),
       ),
+      serverHost(app, actions),
       el('div', { class: 'divider' }, el('span', {}, 'or')),
       el('label', { class: 'label', for: 'code' }, 'Join with a code'),
       el('div', { class: 'row gap' },
@@ -137,22 +138,100 @@ function homeScreen(app, actions) {
         }, app.busy === 'join' ? 'Joining…' : 'Join'),
       ),
     ),
-    rulesCard(),
+    serverLobbies(app, actions),
+    el('button', { class: 'btn big', onclick: openRules }, 'How to play'),
   );
 }
 
-function rulesCard() {
-  return el('details', { class: 'card rules' },
-    el('summary', {}, 'How to play'),
-    el('ol', { class: 'rules-list' },
-      el('li', {}, 'Two teams sit alternately, so the players either side of you are opponents.'),
-      el('li', {}, 'A set is half a suit: 2–7 low, 9–A high. Eight sets of six cards, or nine if the host keeps the 8s in.'),
-      el('li', {}, 'On your turn, ask one opponent for one card. You must already hold a card of that set, and you cannot ask for a card you hold.'),
-      el('li', {}, 'If they have it they hand it over and you ask again. If they do not, the turn passes to them.'),
-      el('li', {}, 'Claim a set by naming who on your team holds each card. Right and it is yours; wrong and it goes to the other team.'),
-      el('li', {}, 'The first team to take the majority of the sets wins.'),
+/**
+ * The second way to host, offered ONLY when a server is configured AND answering.
+ *
+ * 'off' means js/config.js names no server, and then this returns null and the
+ * home screen is what it was before server mode existed — which is the promise
+ * that file's header makes. 'down' is a configured server that is not there, and
+ * that is worth one quiet line rather than silence: the player may be the person
+ * who can switch it back on, and a button that vanishes looks like a bug.
+ */
+function serverHost(app, actions) {
+  const state = (app.server && app.server.state) || 'off';
+  if (state === 'off') return null;
+
+  if (state === 'unknown' || state === 'checking') {
+    return el('p', { class: 'hint server-note' },
+      el('span', { class: 'dot wait' }), 'Checking for the online server…');
+  }
+  if (state === 'down') {
+    return el('p', { class: 'hint server-note' },
+      el('span', { class: 'dot down' }),
+      'The online server isn’t answering, so games run phone-to-phone.');
+  }
+
+  return el('div', { class: 'server-option' },
+    el('div', { class: 'row gap' },
+      el('button', {
+        class: 'btn grow',
+        disabled: !app.name.trim() || app.busy,
+        onclick: () => actions.hostOnline(),
+      }, app.busy === 'hostOnline' ? 'Starting…' : 'Host online'),
     ),
+    el('p', { class: 'hint server-note' },
+      el('span', { class: 'dot up' }),
+      'Server’s up — players can join from anywhere, and the table carries on if you close this tab.'),
   );
+}
+
+/**
+ * Open lobbies on the server.
+ *
+ * Returns null when there is no list, and that covers three cases the player has
+ * no reason to tell apart: no server, a server that is down, and a server with the
+ * list switched off (ROOMS_LIST=0). Typing a code always works, so a standing "no
+ * games online" heading would be noise on a phone that has never used the server.
+ *
+ * The hint at the bottom is not decoration. These codes are readable by anyone on
+ * the internet — that is what publishing the list means — and a player choosing
+ * between this and hosting on their own phone deserves to know which one is which.
+ */
+function serverLobbies(app, actions) {
+  const rooms = app.serverRooms;
+  if (!Array.isArray(rooms) || rooms.length === 0) return null;
+
+  return el('section', { class: 'card' },
+    el('div', { class: 'row between' },
+      el('h2', { class: 'h2' }, 'Games online'),
+      el('span', { class: 'count' }, `${rooms.length} open`),
+    ),
+    el('ul', { class: 'lobbies' }, rooms.map((r) => el('li', {},
+      el('button', {
+        class: 'lobby-row',
+        disabled: !app.name.trim() || !!app.busy,
+        onclick: () => actions.joinServerRoom(r.code),
+      },
+        el('span', { class: 'lobby-code' }, r.code),
+        el('span', { class: 'lobby-meta' },
+          el('span', { class: 'lobby-host' }, `${r.hostName || 'Someone'}’s table`),
+          el('span', { class: 'lobby-sub' }, `${r.playerCount} of ${r.maxPlayers} seated`),
+        ),
+        el('span', { class: 'lobby-go' }, '›'),
+      ),
+    ))),
+    el('p', { class: 'hint' },
+      'Anyone can see these codes. A game hosted on someone’s phone never appears here — ask for the code.'),
+  );
+}
+
+/**
+ * Open the rules.
+ *
+ * The dialog itself is static markup in index.html, not part of this tree —
+ * see the comment there. That makes this the one imperative DOM call in the
+ * file, and it buys the focus trap, the Escape key and the backdrop from the
+ * platform instead of hand-rolling three things that are easy to get subtly
+ * wrong.
+ */
+function openRules() {
+  const dialog = document.getElementById('rules');
+  if (dialog) dialog.showModal();
 }
 
 // ---------------------------------------------------------------------------
@@ -160,7 +239,7 @@ function rulesCard() {
 // ---------------------------------------------------------------------------
 function lobbyScreen(app, actions) {
   const pub = app.pub;
-  const isHost = app.mode === 'host';
+  const isHost = amHost(app);
   const seated = pub ? pub.players.length : 0;
   const wanted = pub ? pub.config.numPlayers : 0;
 
@@ -630,7 +709,7 @@ function overScreen(app, actions) {
   const pub = app.pub;
   if (!pub) return el('div', { class: 'screen over' }, spinner());
 
-  const isHost = app.mode === 'host';
+  const isHost = amHost(app);
   const iWon = !pub.drawn && pub.winner === (app.priv ? app.priv.team : -1);
   const headline = pub.drawn
     ? 'A draw.'
@@ -671,11 +750,37 @@ function overScreen(app, actions) {
 // ---------------------------------------------------------------------------
 // Shared pieces
 // ---------------------------------------------------------------------------
+
+/**
+ * Am I the one who can start the game, seat a bot and deal again?
+ *
+ * Read off the STATE, not off how this tab connected. That used to be
+ * `app.mode === 'host'`, which was true of exactly the browser holding the
+ * engine — and on the server transport no browser holds one, so the person who
+ * opened the table would have been shown a lobby with no controls in it.
+ *
+ * pub.hostId is also the id every host-only intent is checked against, in
+ * intents.js and therefore on the Pi as well. Deriving the buttons from the same
+ * field means this can never draw a control the engine would then refuse.
+ */
+function amHost(app) {
+  return !!(app.pub && app.myId && app.pub.hostId === app.myId);
+}
+
 function topBar(app, actions, title) {
   return el('header', { class: 'topbar' },
     el('span', { class: 'brand' }, title),
     app.code && el('span', { class: 'roomtag' }, app.code),
     el('span', { class: `dot ${app.connected ? 'up' : 'down'}`, title: app.connected ? 'Connected' : 'Offline' }),
+    // A glyph rather than the words: the bar already carries a title, a room
+    // code, a status dot and Leave, and "How to play" spelled out pushes the
+    // row past the width of a phone. The accessible name is the full phrase.
+    el('button', {
+      class: 'icon help',
+      title: 'How to play',
+      'aria-label': 'How to play',
+      onclick: openRules,
+    }, '?'),
     el('button', { class: 'btn small', onclick: () => actions.leave() }, 'Leave'),
   );
 }

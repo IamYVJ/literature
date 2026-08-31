@@ -1,0 +1,106 @@
+# ============================================================================
+# Deployment stack for the Pi. Paste this into Komodo as the stack definition, or
+# run it with `docker compose -f server/compose.yaml up -d` on the Pi itself.
+#
+# WHAT IS NOT HERE, AND WHY: a `ports:` mapping.
+#
+# Nothing outside the Docker network may reach this container. Caddy is on the same
+# `games` network and resolves it by container NAME (`reverse_proxy
+# literature-server:9000`); Caddy in turn is bound to 127.0.0.1:8080 only, and the
+# Tailscale Funnel is what makes port 443 public. Publishing a port here would put
+# the game server on the Pi's LAN address as well, bypassing the one place the
+# origin check and TLS live.
+#
+# The image is arm64-only (see .github/workflows/server.yml). On any other
+# architecture this will fail with "exec format error", which is correct — it means
+# you are not on the Pi.
+# ============================================================================
+services:
+  literature-server:
+    image: ghcr.io/iamyvj/literature-server:latest
+    # Fixed, because Caddy's reverse_proxy target is this name.
+    container_name: literature-server
+    restart: unless-stopped
+
+    environment:
+      # NODE_ENV is a safety switch, not a performance one: it is what makes
+      # guards.js refuse a missing Origin header and refuse localhost. It is set in
+      # the image too, and repeated here so that nobody removing it from one place
+      # can remove it from both by accident.
+      NODE_ENV: production
+      PORT: 9000
+
+      # MUST list the exact origin the client is served from, scheme and host, no
+      # trailing slash and no path. Comma-separate to add more (a local test copy,
+      # a custom domain). A wildcard is ignored in production on purpose.
+      ALLOWED_ORIGINS: https://iamyvj.github.io
+
+      # Global ceilings. Per-IP limits are not possible behind a Funnel — every
+      # connection arrives from the proxy and X-Forwarded-For is client-written — so
+      # these are the numbers that are actually true. Sized for a 2GB Pi sharing the
+      # box with Caddy, Komodo and the other games.
+      MAX_CONNS: '200'
+      MAX_ROOMS: '50'
+
+      # 1 lists open lobbies at /literature/rooms so players can find a game without
+      # being told the code. 0 turns that off: codes then travel by word of mouth
+      # only. The list exposes nothing but codes and player counts, and codes were
+      # never secrets — but it does make every open lobby enumerable by anyone on
+      # the internet, so it is a choice rather than a default to ignore.
+      ROOMS_LIST: '1'
+
+      # How long a seat nobody is sitting in is left alone before the table plays
+      # it. This one is peculiar to Literature and is the setting most worth
+      # thinking about before changing: a HIT KEEPS THE TURN, so a player whose
+      # phone locks does not cost the table one beat — the game stops dead until
+      # they come back, and with the turn clock off (the default) there is nothing
+      # else to move it on. 30s is patient enough for a tunnel or a lock screen and
+      # short enough that the others do not give up. Lower it for a table of
+      # strangers; raise it for a table that will wait.
+      AWAY_MS: '30000'
+
+    networks:
+      - games
+
+    # --- container hygiene ---------------------------------------------------
+    # The server keeps every room in memory and writes nothing to disk, so the
+    # filesystem can be read-only. /tmp is a tmpfs because Node wants somewhere to
+    # put a scratch file even when the app never asks for one.
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+
+    # A runaway room count should hit MAX_ROOMS long before this, but a hard cap
+    # means the worst case is this container being killed rather than the Pi
+    # swapping itself to death and taking Komodo and the reverse proxy with it.
+    mem_limit: 256m
+    pids_limit: 256
+
+    # Unbounded json-file logs are the classic way a Pi fills its SD card months
+    # after everything was working. Worth knowing what is in them here: one line
+    # per game start and one per finish, with player names in both. Names are
+    # whatever players typed, so treat the journal as you would a chat log.
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+
+    # The image's own HEALTHCHECK asks /health over the loopback. Restated here so
+    # `docker ps` shows health even if the stack is ever pointed at an older tag.
+    healthcheck:
+      test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:9000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  # Created once on the Pi with `docker network create games`, and shared with
+  # Caddy and the other game servers. `external: true` means this stack joins it
+  # rather than owning it — so tearing this stack down cannot take the network,
+  # and the reverse proxy, with it.
+  games:
+    external: true

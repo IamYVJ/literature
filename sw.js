@@ -10,6 +10,12 @@
 // needs to reach a signaling broker to set up the WebRTC handshake. What you do
 // get offline is the shell itself, which is what makes the app openable from a
 // home screen. See js/net.js for self-hosting a broker on the LAN.
+//
+// AND NOTHING HERE MAY CACHE THE SERVER'S /health. The client decides whether to
+// offer server mode at all on the strength of that one request, so a cached "yes"
+// would strand a player in a mode whose server is switched off — offering a Host
+// online button that can only ever time out. See the fetch handler below and the
+// note on SERVER_HEALTH in js/config.js.
 // ============================================================================
 
 // Bump this version to invalidate old caches on the next activate.
@@ -22,8 +28,14 @@
 // until the next reload. A new cache NAME is built to one side and swapped in
 // whole at activate, which cannot half-apply.
 //
-// So: change what modules import from each other -> bump this.
-const CACHE = 'literature-v2';
+// The same hazard applies to any two shell files that only work as a pair, not
+// just to ES imports: ui.js opens the <dialog> that lives in index.html, so a
+// new ui.js against an old index.html gives a How-to-play button that silently
+// does nothing.
+//
+// So: change what modules import from each other, or split a feature across two
+// shell files -> bump this.
+const CACHE = 'literature-v4';
 
 // Core app shell (same-origin). Relative to the SW's scope.
 //
@@ -42,7 +54,9 @@ const SHELL = [
   './js/rules.js',
   './js/cards.js',
   './js/bots.js',
+  './js/botdriver.js',
   './js/net.js',
+  './js/config.js',
   './js/intents.js',
   './js/guards.js',
   './js/util.js',
@@ -83,6 +97,17 @@ self.addEventListener('fetch', (event) => {
   if (req.method !== 'GET') return;
 
   const url = new URL(req.url);
+
+  // THE LIVENESS PROBE IS NEVER CACHED, whoever is serving it.
+  //
+  // js/config.js points the probe at another origin, so today this request would
+  // fall through to the network anyway — the same-origin branch below would not
+  // claim it. This is here because that is a coincidence of one config value and
+  // not a property of the app: serve the client from the same host as the server
+  // and a cached `{"ok":true}` would survive the Pi being switched off, leaving
+  // every visit offering a Host online button that can only ever time out. A
+  // stale "no" costs one refresh; a stale "yes" costs the player the whole join.
+  if (url.pathname.endsWith('/health')) return;
 
   const isFont = url.hostname === 'fonts.googleapis.com' || url.hostname === 'fonts.gstatic.com';
   const isCDN = url.hostname === 'unpkg.com';

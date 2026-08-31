@@ -374,11 +374,177 @@ export function joinHost(code, handlers = {}) {
   };
 }
 
+// ===========================================================================
+// SERVER TRANSPORT — the second way this app can play.
+//
+// Everything above is peer-to-peer and stays exactly as it was. What follows is a
+// plain WebSocket to an authoritative server, and it is deliberately shaped to
+// present the SAME interface as joinHost() above — send / isOpen / destroy, and
+// onOpen / onData / onClose / onError — so main.js can hold either one in `net`
+// and the intent path does not have to know which is which.
+//
+// The asymmetry that remains is real and cannot be papered over: on this transport
+// nobody's browser owns a GameEngine, so even the room's owner is a client sending
+// messages. That is handled in main.js (app.mode), not here.
+// ===========================================================================
+
+/**
+ * Open a socket to the server.
+ *
+ * No reconnect logic in here, on purpose. A dropped socket means something
+ * different depending on whether we had a game yet, and only main.js knows that —
+ * the same division of labour joinHost() already has with its join timeout.
+ */
+export function serverTransport(url, handlers = {}) {
+  let ws;
+  let opened = false;
+  let dead = false;
+
+  try {
+    ws = new WebSocket(url);
+  } catch (err) {
+    // A malformed URL throws synchronously. Report it asynchronously anyway, so
+    // the caller's error path is the same one it uses for every other failure.
+    setTimeout(() => handlers.onError && handlers.onError(err), 0);
+    return { send() {}, isOpen() { return false; }, destroy() {} };
+  }
+
+  ws.onopen = () => { opened = true; handlers.onOpen && handlers.onOpen(); };
+
+  ws.onmessage = (event) => {
+    // Text frames only. The server never sends binary, so anything else is either
+    // a proxy misbehaving or not our server at all.
+    if (typeof event.data !== 'string') return;
+    const msg = safeParse(event.data);
+    if (msg && typeof msg.type === 'string') handlers.onData && handlers.onData(msg);
+  };
+
+  // A browser will not tell a page WHY a WebSocket failed — there is no status
+  // code for a 403 from the origin check, and no distinguishing a refused
+  // handshake from an unplugged router. All the page gets is close. So the useful
+  // signal is `opened`: a socket that never opened at all is a connection problem
+  // to report, and one that opened and then closed is a game to reconnect to.
+  ws.onclose = (event) => {
+    if (dead) return;
+    dead = true;
+    handlers.onClose && handlers.onClose({
+      everOpened: opened,
+      code: event ? event.code : 0,
+      // 1000 is a deliberate close from the server (a redeploy, or a seat taken
+      // over by another device); anything else is a failure.
+      clean: !!(event && event.wasClean),
+    });
+  };
+
+  ws.onerror = () => {
+    // Always followed by close, which is where the decision is made. Swallowing it
+    // here keeps an uninformative event from being reported twice.
+  };
+
+  return {
+    ws,
+    send(msg) {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      try { ws.send(JSON.stringify(msg)); } catch (_) { /* closing */ }
+    },
+    isOpen() { return ws.readyState === WebSocket.OPEN; },
+    destroy() {
+      dead = true;           // stop our own onclose from firing a handler
+      ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
+      try { ws.close(1000, 'Left'); } catch (_) {}
+    },
+  };
+}
+
+/**
+ * Is the server there? Resolves to the /health body, or null.
+ *
+ * Deliberately cheap and deliberately timed out: this runs at boot, on the home
+ * screen, before the player has asked for anything — so a Pi that is off must cost
+ * a couple of seconds of a hidden probe and nothing else. Never throws; the caller
+ * only has to distinguish an object from null.
+ */
+export async function probeServer(url, timeoutMs = 4000) {
+  if (!url) return null;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal, cache: 'no-store' });
+    if (!res.ok) return null;
+    const body = await res.json();
+    return body && body.ok ? body : null;
+  } catch (_) {
+    return null;            // offline, aborted, CORS, DNS, a captive portal…
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Open lobbies on the server, or null if there is no list to be had.
+ *
+ * null covers three cases that the UI treats identically: the server is down, the
+ * server has the list switched off (ROOMS_LIST=0, answered as a 404), or the
+ * response was not what we expected. "No list" is not an error worth showing —
+ * typing a code always works.
+ */
+export async function fetchServerRooms(url, timeoutMs = 4000) {
+  if (!url) return null;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal, cache: 'no-store' });
+    if (!res.ok) return null;
+    const body = await res.json();
+    return body && Array.isArray(body.rooms) ? body.rooms : null;
+  } catch (_) {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** What a server refusal means, in words a player can act on.
+ *
+ *  The reasons are the ones server/session.js sends, and it sends a message of its
+ *  own with each. These override that message only where the CLIENT knows better,
+ *  because it knows what the player was trying to do and what the app can offer
+ *  instead — 'in-progress' can suggest a rematch, 'server-full' can point at the
+ *  peer-to-peer path that is still sitting right there on the home screen.
+ *
+ *  'no-room' is missing on purpose even though the server sends it: main.js
+ *  intercepts that one before it ever reaches here and retries the same code over
+ *  peer-to-peer, because a code that is not on the server may well be a phone
+ *  hosting in the next room. */
+export function describeServerRejection(reason, message) {
+  switch (reason) {
+    case 'no-room':
+      return 'No game with that code is running on the server.';
+    case 'in-progress':
+      return 'That game has already started, so there is no seat to take. Ask the host to start a rematch.';
+    case 'name-taken':
+      return 'Someone in that game is already using that name — pick another.';
+    case 'server-full':
+      return 'The server has as many games as it can hold. Try again in a few minutes, or host on Wi-Fi instead.';
+    case 'too-many':
+      return 'Too many devices have joined that game already.';
+    case 'replaced':
+      return 'You opened this game on another device, so this one was disconnected.';
+    default:
+      return message || 'The server refused the connection.';
+  }
+}
+
 // ---------------------------------------------------------------------------
-// Wire helper — JSON over the DataConnection.
+// Wire helpers — JSON on the way out, guarded JSON on the way in.
 // ---------------------------------------------------------------------------
 function trySend(conn, msg) {
   try { conn.send(JSON.stringify(msg)); } catch (_) { /* connection torn down */ }
+}
+
+function safeParse(raw) {
+  if (typeof raw !== 'string') return raw && typeof raw === 'object' ? raw : null;
+  try { return JSON.parse(raw); } catch (_) { return null; }
 }
 
 // ---------------------------------------------------------------------------
