@@ -1,0 +1,17 @@
+{
+  "name": "Literature — Collect the Half-Suits",
+  "short_name": "Literature",
+  "description": "Host a peer-to-peer game of Literature (Fish) from your browser. Ask the other team for cards, collect half-suits, claim before they do.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0A0F16",
+  "theme_color": "#0A0F16",
+  "icons": [
+    { "src": "./icons/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "./icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "./icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "./icons/icon-maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

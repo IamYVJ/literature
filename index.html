@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#0A0F16" />
+  <meta name="description" content="Literature — the hidden-hand card game (Fish, Canadian Fish), played peer-to-peer from your own browser. Ask the other team for cards, collect half-suits, claim before they do. No game server, no accounts." />
+  <title>Literature — Collect the Half-Suits</title>
+
+  <!-- PWA manifest (relative path for GitHub Pages subpaths). -->
+  <link rel="manifest" href="./manifest.webmanifest" />
+  <link rel="icon" type="image/svg+xml" href="./icons/icon.svg" />
+  <link rel="apple-touch-icon" href="./icons/icon-192.png" />
+
+  <!-- Fonts. Preconnect + Google Fonts; the service worker caches the served
+       font files so the offline shell still renders correctly. -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Crimson+Pro:ital,wght@0,500;0,700;1,500&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet" />
+
+  <link rel="stylesheet" href="./css/styles.css" />
+
+  <!-- PeerJS via CDN, pinned. Provides window.Peer (WebRTC signaling + P2P).
+       NOTE: the initial signaling handshake needs network reachability even
+       when the app shell is cached offline. See js/net.js for self-hosting. -->
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+</head>
+<body>
+  <div id="app" class="app-root"></div>
+  <!-- Screen-reader announcements. Deliberately OUTSIDE #app: a live region only
+       fires when text changes inside a node that was already in the document,
+       and #app is emptied and rebuilt on every render. -->
+  <div id="announce" class="sr-only" role="status" aria-live="polite"></div>
+  <noscript>This game requires JavaScript to run.</noscript>
+  <script type="module" src="./js/main.js"></script>
+</body>
+</html>

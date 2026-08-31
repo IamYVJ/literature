@@ -1,0 +1,31 @@
+# ============================================================================
+# Run the test suite on every push.
+#
+# WHY THERE IS NO BUILD OR DEPLOY JOB
+#   The site is served straight from the branch by GitHub Pages, so there is
+#   nothing to build and no artefact to publish. That also means nothing gates
+#   the deploy: a push updates the live site whether this job passes or not, so
+#   read a red run as "the site is live and broken", not "the release stopped".
+#
+# WHY THERE IS NO INSTALL STEP
+#   The project has no dependencies at all — the tests use nothing but Node's
+#   standard library. `npm ci` would fail for want of a lockfile, and adding one
+#   for zero packages is not worth the file.
+# ============================================================================
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm test
